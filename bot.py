@@ -1,6 +1,11 @@
+```python
 import os
 import asyncio
 import json
+import glob
+import time
+import atexit
+import sys
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -79,17 +84,82 @@ def save_json(filename, data):
 # Загружаем пользователей
 users = load_json(USERS_FILE, [])
 
-# Загружаем дополнительных админов
+
+# =========================================================
+# СОВМЕСТИМОСТЬ СО СТАРЫМ users.json
+# =========================================================
+#
+# Старый код сохранял:
+#
+# [
+#     123456789,
+#     987654321
+# ]
+#
+# Новый формат:
+#
+# [
+#     {
+#         "id": 123456789,
+#         "username": "username"
+#     }
+# ]
+#
+# Преобразуем старый формат в новый автоматически,
+# ничего не теряя.
+# =========================================================
+
+normalized_users = []
+
+for user in users:
+
+    if isinstance(user, dict):
+
+        try:
+            user_id = int(user.get("id"))
+
+            obj = {
+                "id": user_id
+            }
+
+            if user.get("username"):
+                obj["username"] = user.get("username")
+
+            normalized_users.append(obj)
+
+        except Exception:
+            pass
+
+    else:
+
+        try:
+            normalized_users.append({
+                "id": int(user)
+            })
+        except Exception:
+            pass
+
+
+users = normalized_users
+
+
+# =========================================================
+# ДОПОЛНИТЕЛЬНЫЕ АДМИНИСТРАТОРЫ
+# =========================================================
+
 saved_admins = load_json(ADMINS_FILE, [])
 
 for admin_id in saved_admins:
+
     try:
         ADMIN_IDS.add(int(admin_id))
+
     except:
         pass
 
 
 def save_admins():
+
     save_json(
         ADMINS_FILE,
         list(ADMIN_IDS)
@@ -97,16 +167,52 @@ def save_admins():
 
 
 def save_users():
+
     save_json(
         USERS_FILE,
         users
     )
 
 
-def register_user(user_id):
-    if user_id not in users:
-        users.append(user_id)
-        save_users()
+def register_user(user_id, username=None):
+
+    # Ищем существующего пользователя
+    for user in users:
+
+        try:
+
+            if int(user.get("id")) == int(user_id):
+
+                # Обновляем username, если он появился
+                if username:
+
+                    current_username = user.get("username")
+
+                    if not current_username:
+
+                        user["username"] = username
+
+                        save_users()
+
+                return
+
+        except Exception:
+
+            continue
+
+
+    # Новый пользователь
+    obj = {
+        "id": int(user_id)
+    }
+
+    if username:
+
+        obj["username"] = username
+
+    users.append(obj)
+
+    save_users()
 
 
 # =========================================================
@@ -114,8 +220,13 @@ def register_user(user_id):
 # =========================================================
 
 if PROXY:
-    session = AiohttpSession(proxy=PROXY)
+
+    session = AiohttpSession(
+        proxy=PROXY
+    )
+
 else:
+
     session = AiohttpSession()
 
 
@@ -123,6 +234,7 @@ bot = Bot(
     token=TOKEN,
     session=session
 )
+
 
 dp = Dispatcher(
     storage=MemoryStorage()
@@ -134,18 +246,22 @@ dp = Dispatcher(
 # =========================================================
 
 class FeedbackState(StatesGroup):
+
     waiting_message = State()
 
 
 class BroadcastState(StatesGroup):
+
     waiting_message = State()
 
 
 class ReplyState(StatesGroup):
+
     waiting_message = State()
 
 
 class AddAdminState(StatesGroup):
+
     waiting_id = State()
 
 
@@ -154,7 +270,209 @@ class AddAdminState(StatesGroup):
 # =========================================================
 
 def is_admin(user_id):
+
     return user_id in ADMIN_IDS
+
+
+# =========================================================
+# УТИЛИТЫ ДЛЯ КОМАНД ОТ LAUNCHER
+# =========================================================
+
+async def broadcast_all(text):
+
+    success = 0
+    failed = 0
+
+    for user in list(users):
+
+        try:
+
+            user_id = int(
+                user.get("id")
+            )
+
+            await bot.send_message(
+                user_id,
+                text
+            )
+
+            success += 1
+
+            await asyncio.sleep(0.05)
+
+        except Exception as error:
+
+            failed += 1
+
+            print(
+                f"Ошибка отправки {user}: {error}"
+            )
+
+
+    print(
+        f"Broadcast done: sent={success}, failed={failed}"
+    )
+
+
+async def reply_to_user(
+    user_id: int,
+    message_text: str
+):
+
+    try:
+
+        await bot.send_message(
+            user_id,
+            "💬 Сообщение от команды VIX:\n\n"
+            f"{message_text}"
+        )
+
+        print(
+            f"Reply sent to {user_id}"
+        )
+
+    except Exception as error:
+
+        print(
+            f"Failed to send reply to {user_id}: {error}"
+        )
+
+
+async def process_command_file(path):
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+    except Exception as error:
+
+        print(
+            "Failed to read command",
+            path,
+            error
+        )
+
+        return
+
+
+    action = data.get("action")
+
+
+    if action == "broadcast":
+
+        msg = data.get(
+            "message",
+            ""
+        )
+
+        await broadcast_all(msg)
+
+
+    elif action == "reply":
+
+        user_id = data.get(
+            "user_id"
+        )
+
+        msg = data.get(
+            "message",
+            ""
+        )
+
+        if user_id:
+
+            await reply_to_user(
+                int(user_id),
+                msg
+            )
+
+
+    else:
+
+        print(
+            "Unknown action",
+            action
+        )
+
+
+    # После обработки удаляем файл команды
+    try:
+
+        os.remove(path)
+
+    except Exception:
+
+        pass
+
+
+async def commands_watcher():
+
+    cmds_dir = os.path.join(
+        os.getcwd(),
+        "commands"
+    )
+
+    os.makedirs(
+        cmds_dir,
+        exist_ok=True
+    )
+
+    seen = set()
+
+    while True:
+
+        try:
+
+            files = glob.glob(
+                os.path.join(
+                    cmds_dir,
+                    "*.json"
+                )
+            )
+
+
+            for file_path in files:
+
+                if file_path in seen:
+
+                    # Всё равно пытаемся обработать файл,
+                    # если watcher был перезапущен
+                    pass
+
+
+                try:
+
+                    await process_command_file(
+                        file_path
+                    )
+
+                except Exception as error:
+
+                    print(
+                        "Error processing command",
+                        file_path,
+                        error
+                    )
+
+
+                seen.add(file_path)
+
+
+        except Exception as error:
+
+            print(
+                "commands_watcher error",
+                error
+            )
+
+
+        await asyncio.sleep(1)
 
 
 # =========================================================
@@ -279,7 +597,10 @@ def admin_menu():
 @dp.message(CommandStart())
 async def start(message: Message):
 
-    register_user(message.from_user.id)
+    register_user(
+        message.from_user.id,
+        message.from_user.username
+    )
 
     text = (
         "VIX Help\n\n"
@@ -302,13 +623,21 @@ async def start(message: Message):
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
 
-    register_user(message.from_user.id)
+    register_user(
+        message.from_user.id,
+        message.from_user.username
+    )
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
+
         await message.answer(
             "⛔ У вас нет доступа к админ-панели."
         )
+
         return
+
 
     await message.answer(
         "👑 VIX Help — Админ-панель\n\n"
@@ -322,9 +651,14 @@ async def admin_command(message: Message):
 # =========================================================
 
 @dp.callback_query(F.data == "info")
-async def information(callback: CallbackQuery):
+async def information(
+    callback: CallbackQuery
+):
 
-    register_user(callback.from_user.id)
+    register_user(
+        callback.from_user.id,
+        callback.from_user.username
+    )
 
     await callback.message.edit_text(
         "VIX Help — Проекты\n\n"
@@ -340,9 +674,14 @@ async def information(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "back")
-async def back(callback: CallbackQuery):
+async def back(
+    callback: CallbackQuery
+):
 
-    register_user(callback.from_user.id)
+    register_user(
+        callback.from_user.id,
+        callback.from_user.username
+    )
 
     text = (
         "VIX Help\n\n"
@@ -365,7 +704,9 @@ async def back(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "business")
-async def business(callback: CallbackQuery):
+async def business(
+    callback: CallbackQuery
+):
 
     await callback.message.edit_text(
         "💼 Бизнес\n\n"
@@ -381,7 +722,9 @@ async def business(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "security")
-async def security(callback: CallbackQuery):
+async def security(
+    callback: CallbackQuery
+):
 
     await callback.message.edit_text(
         "🛡 VIX Security System\n\n"
@@ -397,7 +740,9 @@ async def security(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "gameclub")
-async def gameclub(callback: CallbackQuery):
+async def gameclub(
+    callback: CallbackQuery
+):
 
     await callback.message.edit_text(
         "🎮 VIX Game Club\n\n"
@@ -413,7 +758,9 @@ async def gameclub(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "carhub")
-async def carhub(callback: CallbackQuery):
+async def carhub(
+    callback: CallbackQuery
+):
 
     await callback.message.edit_text(
         "🚗 VIX CarHub\n\n"
@@ -429,7 +776,9 @@ async def carhub(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "about")
-async def about(callback: CallbackQuery):
+async def about(
+    callback: CallbackQuery
+):
 
     await callback.message.edit_text(
         "👤 О нас\n\n"
@@ -445,9 +794,15 @@ async def about(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "feedback")
-async def feedback(callback: CallbackQuery, state: FSMContext):
+async def feedback(
+    callback: CallbackQuery,
+    state: FSMContext
+):
 
-    register_user(callback.from_user.id)
+    register_user(
+        callback.from_user.id,
+        callback.from_user.username
+    )
 
     await state.set_state(
         FeedbackState.waiting_message
@@ -467,7 +822,9 @@ async def feedback(callback: CallbackQuery, state: FSMContext):
 # ОБРАТНАЯ СВЯЗЬ — ПОЛУЧЕНИЕ СООБЩЕНИЯ
 # =========================================================
 
-@dp.message(FeedbackState.waiting_message)
+@dp.message(
+    FeedbackState.waiting_message
+)
 async def feedback_message(
     message: Message,
     state: FSMContext
@@ -484,6 +841,7 @@ async def feedback_message(
 
         return
 
+
     user_id = message.from_user.id
 
     username = (
@@ -491,6 +849,14 @@ async def feedback_message(
         if message.from_user.username
         else "нет username"
     )
+
+
+    # Обновляем данные пользователя
+    register_user(
+        user_id,
+        message.from_user.username
+    )
+
 
     admin_text = (
         "📩 НОВАЯ ОБРАТНАЯ СВЯЗЬ\n\n"
@@ -501,6 +867,7 @@ async def feedback_message(
         f"{message.text or '[не текстовое сообщение]'}"
     )
 
+
     kb = InlineKeyboardBuilder()
 
     kb.button(
@@ -510,9 +877,11 @@ async def feedback_message(
 
     kb.adjust(1)
 
+
     for admin_id in ADMIN_IDS:
 
         try:
+
             await bot.send_message(
                 admin_id,
                 admin_text,
@@ -527,7 +896,9 @@ async def feedback_message(
                 f"{admin_id}: {error}"
             )
 
+
     await state.clear()
+
 
     await message.answer(
         "✅ Сообщение отправлено команде VIX.\n\n"
@@ -540,13 +911,17 @@ async def feedback_message(
 # ОТВЕТ ПОЛЬЗОВАТЕЛЮ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("reply:"))
+@dp.callback_query(
+    F.data.startswith("reply:")
+)
 async def reply_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
 
-    if not is_admin(callback.from_user.id):
+    if not is_admin(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -555,16 +930,22 @@ async def reply_start(
 
         return
 
+
     try:
+
         user_id = int(
             callback.data.split(":")[1]
         )
+
     except:
+
         await callback.answer(
             "Ошибка ID пользователя.",
             show_alert=True
         )
+
         return
+
 
     await state.update_data(
         reply_user_id=user_id
@@ -573,6 +954,7 @@ async def reply_start(
     await state.set_state(
         ReplyState.waiting_message
     )
+
 
     await callback.message.answer(
         f"↩️ Ответ пользователю `{user_id}`\n\n"
@@ -584,14 +966,20 @@ async def reply_start(
     await callback.answer()
 
 
-@dp.message(ReplyState.waiting_message)
+@dp.message(
+    ReplyState.waiting_message
+)
 async def reply_send(
     message: Message,
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
+
         return
+
 
     if message.text == "/cancel":
 
@@ -603,9 +991,13 @@ async def reply_send(
 
         return
 
+
     data = await state.get_data()
 
-    user_id = data.get("reply_user_id")
+    user_id = data.get(
+        "reply_user_id"
+    )
+
 
     if not user_id:
 
@@ -616,6 +1008,7 @@ async def reply_send(
         )
 
         return
+
 
     try:
 
@@ -636,6 +1029,7 @@ async def reply_send(
             f"{error}"
         )
 
+
     await state.clear()
 
 
@@ -643,13 +1037,17 @@ async def reply_send(
 # АДМИН — РАССЫЛКА
 # =========================================================
 
-@dp.callback_query(F.data == "admin_broadcast")
+@dp.callback_query(
+    F.data == "admin_broadcast"
+)
 async def admin_broadcast(
     callback: CallbackQuery,
     state: FSMContext
 ):
 
-    if not is_admin(callback.from_user.id):
+    if not is_admin(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -658,9 +1056,11 @@ async def admin_broadcast(
 
         return
 
+
     await state.set_state(
         BroadcastState.waiting_message
     )
+
 
     await callback.message.answer(
         "📢 РАССЫЛКА\n\n"
@@ -673,14 +1073,20 @@ async def admin_broadcast(
     await callback.answer()
 
 
-@dp.message(BroadcastState.waiting_message)
+@dp.message(
+    BroadcastState.waiting_message
+)
 async def broadcast_send(
     message: Message,
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
+
         return
+
 
     if message.text == "/cancel":
 
@@ -692,16 +1098,23 @@ async def broadcast_send(
 
         return
 
+
     await message.answer(
         "📢 Рассылка началась..."
     )
 
+
     success = 0
     failed = 0
 
-    for user_id in users:
+
+    for user in list(users):
 
         try:
+
+            user_id = int(
+                user.get("id")
+            )
 
             await bot.send_message(
                 user_id,
@@ -717,10 +1130,12 @@ async def broadcast_send(
             failed += 1
 
             print(
-                f"Ошибка отправки {user_id}: {error}"
+                f"Ошибка отправки {user}: {error}"
             )
 
+
     await state.clear()
+
 
     await message.answer(
         "📊 Результат рассылки\n\n"
@@ -734,10 +1149,16 @@ async def broadcast_send(
 # АДМИН — ПОЛЬЗОВАТЕЛИ
 # =========================================================
 
-@dp.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery):
+@dp.callback_query(
+    F.data == "admin_users"
+)
+async def admin_users(
+    callback: CallbackQuery
+):
 
-    if not is_admin(callback.from_user.id):
+    if not is_admin(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -745,6 +1166,7 @@ async def admin_users(callback: CallbackQuery):
         )
 
         return
+
 
     await callback.message.answer(
         "👥 Пользователи\n\n"
@@ -758,10 +1180,16 @@ async def admin_users(callback: CallbackQuery):
 # АДМИН — СПИСОК АДМИНОВ
 # =========================================================
 
-@dp.callback_query(F.data == "admin_admins")
-async def admin_admins(callback: CallbackQuery):
+@dp.callback_query(
+    F.data == "admin_admins"
+)
+async def admin_admins(
+    callback: CallbackQuery
+):
 
-    if not is_admin(callback.from_user.id):
+    if not is_admin(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -770,10 +1198,14 @@ async def admin_admins(callback: CallbackQuery):
 
         return
 
+
     text = "👑 Администраторы:\n\n"
 
+
     for admin_id in ADMIN_IDS:
+
         text += f"🆔 `{admin_id}`\n"
+
 
     await callback.message.answer(
         text,
@@ -787,13 +1219,17 @@ async def admin_admins(callback: CallbackQuery):
 # АДМИН — ДОБАВИТЬ АДМИНА
 # =========================================================
 
-@dp.callback_query(F.data == "admin_add")
+@dp.callback_query(
+    F.data == "admin_add"
+)
 async def admin_add(
     callback: CallbackQuery,
     state: FSMContext
 ):
 
-    if not is_admin(callback.from_user.id):
+    if not is_admin(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -802,9 +1238,11 @@ async def admin_add(
 
         return
 
+
     await state.set_state(
         AddAdminState.waiting_id
     )
+
 
     await callback.message.answer(
         "➕ Добавление администратора\n\n"
@@ -817,14 +1255,20 @@ async def admin_add(
     await callback.answer()
 
 
-@dp.message(AddAdminState.waiting_id)
+@dp.message(
+    AddAdminState.waiting_id
+)
 async def admin_add_process(
     message: Message,
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
+
         return
+
 
     if message.text == "/cancel":
 
@@ -836,6 +1280,7 @@ async def admin_add_process(
 
         return
 
+
     if not message.text.isdigit():
 
         await message.answer(
@@ -845,19 +1290,28 @@ async def admin_add_process(
 
         return
 
-    new_admin_id = int(message.text)
 
-    ADMIN_IDS.add(new_admin_id)
+    new_admin_id = int(
+        message.text
+    )
+
+
+    ADMIN_IDS.add(
+        new_admin_id
+    )
 
     save_admins()
 
+
     await state.clear()
+
 
     await message.answer(
         "✅ Администратор добавлен.\n\n"
         f"🆔 ID: `{new_admin_id}`",
         parse_mode="Markdown"
     )
+
 
     try:
 
@@ -879,10 +1333,16 @@ async def admin_add_process(
 # ОТМЕНА
 # =========================================================
 
-@dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
+@dp.message(
+    Command("cancel")
+)
+async def cancel(
+    message: Message,
+    state: FSMContext
+):
 
     current_state = await state.get_state()
+
 
     if current_state:
 
@@ -901,17 +1361,141 @@ async def cancel(message: Message, state: FSMContext):
 
 
 # =========================================================
+# PID LOCK
+# =========================================================
+
+PIDFILE = "bot.pid"
+
+
+def remove_pidfile():
+
+    try:
+
+        if os.path.exists(PIDFILE):
+
+            os.remove(
+                PIDFILE
+            )
+
+    except Exception:
+
+        pass
+
+
+def already_running():
+
+    if os.path.exists(PIDFILE):
+
+        try:
+
+            with open(
+                PIDFILE,
+                "r"
+            ) as file:
+
+                pid = int(
+                    file.read().strip()
+                )
+
+
+            # Проверяем, существует ли процесс
+            try:
+
+                os.kill(
+                    pid,
+                    0
+                )
+
+                return True
+
+            except Exception:
+
+                try:
+
+                    os.remove(
+                        PIDFILE
+                    )
+
+                except:
+
+                    pass
+
+                return False
+
+
+        except Exception:
+
+            try:
+
+                os.remove(
+                    PIDFILE
+                )
+
+            except:
+
+                pass
+
+            return False
+
+
+    return False
+
+
+# =========================================================
 # ЗАПУСК
 # =========================================================
 
 async def main():
 
-    print("VIX Help запускается...")
+    # =====================================================
+    # PID LOCK
+    # =====================================================
+
+    if already_running():
+
+        print(
+            "Another instance is running. Exiting."
+        )
+
+        return
+
+
+    with open(
+        PIDFILE,
+        "w"
+    ) as file:
+
+        file.write(
+            str(os.getpid())
+        )
+
+
+    atexit.register(
+        remove_pidfile
+    )
+
+
+    # =====================================================
+    # ЗАПУСК БОТА
+    # =====================================================
+
+    print(
+        "VIX Help запускается..."
+    )
+
 
     if PROXY:
-        print("Прокси включён.")
+
+        print(
+            "Прокси включён."
+        )
+
     else:
-        print("Прокси не используется.")
+
+        print(
+            "Прокси не используется."
+        )
+
 
     print(
         "Администраторы:",
@@ -921,8 +1505,32 @@ async def main():
         )
     )
 
-    await dp.start_polling(bot)
 
+    # =====================================================
+    # WATCHER КОМАНД LAUNCHER
+    # =====================================================
+
+    asyncio.create_task(
+        commands_watcher()
+    )
+
+
+    # =====================================================
+    # POLLING
+    # =====================================================
+
+    await dp.start_polling(
+        bot
+    )
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    asyncio.run(
+        main()
+    )
+```
